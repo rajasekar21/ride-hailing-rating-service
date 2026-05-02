@@ -40,6 +40,7 @@ async function seed() {
     .on("end", async () => {
       await Rating.bulkCreate(results, { ignoreDuplicates: true });
       console.log(`✅ Seeded ${results.length} ratings`);
+      await db.close();
     });
 }
 

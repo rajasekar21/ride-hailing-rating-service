@@ -2,10 +2,24 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const { Sequelize, DataTypes } = require("sequelize");
+const logger = require("./shared/logger");
+const correlationMiddleware = require("./shared/correlationMiddleware");
+const {
+  client,
+  register,
+  avgDriverRating
+} = require("./shared/metrics");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(correlationMiddleware);
+
+const ratingsTotal = new client.Gauge({
+  name: 'rating_ratings_total',
+  help: 'Total number of ratings',
+  registers: [register]
+});
 
 const db = new Sequelize({
   dialect: "sqlite",
@@ -26,9 +40,19 @@ db.sync();
 const TRIP_SERVICE_URL = process.env.TRIP_SERVICE_URL || "http://ride:3000";
 
 app.use((req, res, next) => {
-  const requestId = req.get("X-Request-ID") || `req-${Date.now()}`;
-  req.requestId = requestId;
-  console.log(JSON.stringify({ requestId, method: req.method, path: req.path, body: req.body }));
+  const startMs = Date.now();
+  req.requestId = req.correlationId;
+  req.traceId = req.correlationId;
+  logger.info({ correlationId: req.correlationId, method: req.method, path: req.path }, "request started");
+  res.on("finish", () => {
+    logger.info({
+      correlationId: req.correlationId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startMs
+    }, "request completed");
+  });
   next();
 });
 
@@ -41,7 +65,11 @@ app.post("/v1/trips/:id/rating", async (req, res) => {
     }
 
     const tripResponse = await axios.get(`${TRIP_SERVICE_URL}/v1/trips/${tripId}`, {
-      headers: { "X-Request-ID": req.requestId }
+      headers: {
+        "X-Request-ID": req.requestId,
+        "X-Trace-ID": req.traceId,
+        "x-correlation-id": req.correlationId
+      }
     });
     const trip = tripResponse.data;
     if (!trip || trip.trip_status !== "COMPLETED") {
@@ -61,6 +89,11 @@ app.post("/v1/trips/:id/rating", async (req, res) => {
       feedback: feedback || "",
       created_at: new Date().toISOString()
     });
+    const summary = await Rating.findAll({ attributes: ["rating"] });
+    const total = summary.length;
+    const sum = summary.reduce((acc, row) => acc + Number(row.rating || 0), 0);
+    const avg = total ? Number((sum / total).toFixed(2)) : 0;
+    avgDriverRating.set(avg);
     res.status(201).send(saved);
   } catch (err) {
     if (err.response && err.response.data) {
@@ -89,12 +122,15 @@ app.get("/metrics", async (req, res) => {
   const ratings = await Rating.findAll({ attributes: ["rating"] });
   const total = ratings.length;
   const sum = ratings.reduce((acc, row) => acc + Number(row.rating || 0), 0);
-  res.send({
-    avg_driver_rating: total ? Number((sum / total).toFixed(2)) : 0,
-    ratings_total: total
-  });
+  const avg = total ? Number((sum / total).toFixed(2)) : 0;
+  ratingsTotal.set(total);
+  avgDriverRating.set(avg);
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
 });
 
-app.listen(3000, () => {
-  console.log("Rating service running on port 3000");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  logger.info({ service: "rating", port: PORT }, "service started");
 });
